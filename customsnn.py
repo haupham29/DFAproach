@@ -1,247 +1,128 @@
+import jax.random as jr
+from diffrax import diffeqsolve, ControlTerm, Euler, MultiTerm, ODETerm, SaveAt, VirtualBrownianTree
 import jax
 import jax.numpy as jnp
-import jax.random as jr
 import equinox as eqx
-import diffrax
-from typing import Callable, Optional
-from diffrax import Solution
+from typing import Any, Callable, List, Optional
+from jax.typing import ArrayLike
+from jaxtyping import Array, Bool, Float, Int, Real
 import optimistix as optx
+import diffrax
+import functools as ft
 
-jax.config.update("jax_platform_name", "cpu")
 
-class SpikingNeuron(eqx.Module):
-    """Single-neuron SNN with:
-       - mu, sigma for (v, i)
-       - a spike variable s: ds/dt = intensity(v)
-    """
+
+class CustomStochastic(eqx.Module):
     mu: jnp.ndarray            
     sigma: jnp.ndarray         
-    intensity_params: jnp.ndarray
-    alpha: float              
+    intensity_fn: Callable[..., Float]          
     v_reset: float
+    threshold: float
+    alpha: float
+    cond_fn: List[Callable[..., Float]]
+    drift_vf: Callable[..., Float]
+    diffusion_vf: Callable[..., Float]
 
-    def intensity(self, v):
-        """Example: λ(v) = exp(k*(v - threshold)) From the Paper"""
-        k = self.intensity_params[0]
-        threshold = 1.0
-        return jnp.exp(k*(v - threshold))
+    def __init__(
+        self, mu, sigma, intensity_fn, v_reset=1.0, threshold=1.0, alpha=3e-2):
+        """**Arguments**:
 
-    def drift(self, t, y, args):
-        """y = (v, i, s). dv/dt = mu1*(i - v), di/dt = -mu2*i, ds/dt = intensity(v)."""
-        v, i, s = y
-        mu1, mu2 = self.mu
-        dv = mu1*(i - v)
-        di = -mu2*i
-        ds = self.intensity(v)
-        return jnp.stack([dv, di, ds])
-
-    def diffusion(self, t, y, args):
-        """Inject noise into (v, i). s has no noise => last row=0."""
-        if self.sigma is None:
-            return jnp.zeros((3,2))
+        - `intensity_fn`: The intensity function for spike generation.
+            Should take as input a scalar (voltage) and return a scalar (intensity).
+        - `v_reset`: The reset voltage value for neurons. Defaults to 1.0.
+        - `alpha`: Constant controlling the refractory period. Defaults to 3e-2.
+        - `mu`: A 2-dimensional vector describing the drift term of each neuron.
+            If none is provided, the values are randomly initialized.
+        - `sigma`: A 2 by 2 diffusion matrix. If none is provided, the values are randomly
+            initialized..
+        """
+        self.mu = mu
+        self.threshold = threshold
         
-        block = jnp.array([
-            [self.sigma[0,0], self.sigma[0,1]],
-            [self.sigma[1,0], self.sigma[1,1]],
-            [0.0,              0.0]
-        ])
-        return block
+        def intensity_fn(v):
+            return jnp.maximum(0, jnp.exp(v) * (v - self.threshold))
+        self.intensity_fn = intensity_fn
+        self.v_reset = v_reset
+        self.alpha = alpha
+        if sigma is None:
+            sigma_key = jr.PRNGKey(0)
+            sigma = jr.normal(sigma_key, (2, 2))
+            sigma = jnp.dot(sigma, sigma.T)
+        self.sigma = sigma
 
-    def event_fn(self, y):
-        """spike when s crosses 0 from below."""
-        return y[2]
+        def cond_fn( t, y, args, **kwargs):
+            v, i, s = y
+            return s
 
-    def reset_map(self, y, rng_key):
-        v, i, s = y
-        u = jax.random.uniform(rng_key, shape=())
-        new_v = v - self.v_reset
-        new_s = jnp.log(u) - self.alpha
-        return jnp.array([new_v, i, new_s])
+        self.cond_fn = cond_fn
 
-def solve_spike(neuron: SpikingNeuron,
-                y0: jnp.ndarray,
-                t0: float, t1: float,
-                dt0: float,
-                rng_key,
-                ) -> tuple[float, jnp.ndarray]:
-    # Create the drift/diffusion terms
-    drift_term = diffrax.ODETerm(neuron.drift)
-    if neuron.sigma is not None:
-        # Brownian path needed for SDE
-        bm = diffrax.VirtualBrownianTree(t0, t1, shape=(2,), key=rng_key, tol=1e-6)
-        diffusion_term = diffrax.ControlTerm(neuron.diffusion, bm)
-        terms = diffrax.MultiTerm(drift_term, diffusion_term)
-    else:
-        # no diffusion => ODE
-        terms = drift_term
-
-    # We'll define an event that triggers when s == 0
-    def event_cond(t, y, args, **kwargs):
-        # Check if y is None and handle it
-        if y is None:
-            return jnp.array(float('inf'))  # No event if y is None
-        return neuron.event_fn(y)
-
-    # Create the event without the terminal parameter
-    root_finder = optx.Newton(1e-2, 1e-2, optx.rms_norm)
-    event = diffrax.Event(event_cond, root_finder=root_finder) 
-
-    saveat = diffrax.SaveAt(t0=False, t1=True)
-    solver = diffrax.EulerHeun() 
-    sol = diffrax.diffeqsolve(
-        terms,
-        solver,
-        t0=t0,
-        t1=t1,
-        dt0=dt0,
-        y0=y0,
-        args=None,
-        saveat=saveat,
-        event=event,          # events=Event(...) 
-        max_steps=10_000,
-    )
-    # Fix: The event detection should look for t_final < t1
-    # If solver stopped early, it means an event was detected
-    is_spike = sol.ts[-1] < t1 - 1e-6
-    spike_time = jnp.where(is_spike, sol.ts[-1], t1)
-    # No need for conditional here since we return the state at the end time either way
-    return spike_time, sol.ys[-1]
-
-def run_spiking_neuron(neuron: SpikingNeuron,
-                       y0: jnp.ndarray,
-                       t0: float, t1: float,
-                       dt0: float,
-                       rng_key,
-                       max_spikes=5):
-    """
-    Solve from t0 to t1, stopping each time a spike event triggers,
-    applying the reset map, and continuing.
-    """
-    times = jnp.zeros(max_spikes)
-    states = jnp.zeros((max_spikes, 3))  # Assuming state is 3-dimensional
-    
-    curr_t = t0
-    curr_y = y0
-    
-    for i in range(max_spikes):
-        subkey, subkey_reset = jax.random.split(rng_key)
-        rng_key = subkey
+        def drift_vf(t, y, args):
+            v, i, s = y
+            mu1, mu2 = self.mu
+            ic = args  # args is the input_current
+            dv = mu1 * (i + ic - v)
+            di = -mu2 * i
+            ds = self.intensity_fn(v)
+            return jnp.array([dv, di, ds])
+        self.drift_vf = drift_vf
         
-        spike_t, spike_y = solve_spike(neuron, curr_y, curr_t, t1, dt0, subkey_reset)
-        
-        # Store results (even if no spike occurred)
-        times = times.at[i].set(spike_t)
-        states = states.at[i].set(spike_y)
-        
-        # Determine if we should continue (no break statements)
-        continue_sim = spike_t < t1 - 1e-12
-        
-        # Apply reset
-        post_spike_y = jax.lax.cond(
-            continue_sim,
-            lambda: neuron.reset_map(spike_y, subkey_reset),
-            lambda: curr_y
-        )
-        
-        # Update for next iteration (happens regardless of spike)
-        curr_t = jax.lax.cond(continue_sim, lambda: spike_t, lambda: curr_t)
-        curr_y = post_spike_y
-    
-    return times, states
-
-# --------------------------
-#  Example usage
-# --------------------------
-
-def main():
-    neuron = SpikingNeuron(
-        mu=jnp.array([5.0, 3.0]),
-        sigma=jnp.array([[0.2, 0.0],
-                         [0.0, 0.2]]),
-        intensity_params=jnp.array([5.0]),
-        alpha=0.03,
-        v_reset=1.0,
-    )
-
-    # initial state 
-    y0 = jnp.array([0.2, 0.9, jnp.log(0.2) - neuron.alpha])
-
-    # Solve from t=0 to t=3
-    times, states = run_spiking_neuron(neuron, y0,
-                                       t0=0.0, t1=10.0,
-                                       dt0=0.01,
-                                       rng_key=jax.random.PRNGKey(777),
-                                       max_spikes=10)
-    print("Spike times:", times)
-    print("States:", states)
-
-    import optax 
-    def loss_fn(params: SpikingNeuron, key):
-        
-        # 1) Run the spiking simulation with the given parameters.
-        # 2) Compare the first spike time to a target, e.g. 1.5s.
-        # 3) Return a scalar loss.
-        
-        y0 = jnp.array([0.5, 0.2, jnp.log(0.5) - params.alpha])  # initial (v, i, s)
-
-        times, states = run_spiking_neuron(
-            neuron=params,
-            y0=y0,
-            t0=0.0, t1=3.0,
-            dt0=0.01,
-            rng_key=key,
-            max_spikes=1,  # We only care about first spike for now
-        )
-        
-        # Check if there was a spike before t1
-        t_spike = times[0]
-        t_desired = 1.5
-        return (t_spike - t_desired)**2
-
-    def train_step(params: SpikingNeuron, opt_state, optimizer, rng):
-        """Perform one gradient step."""
-        # Compute loss and grads
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(params, rng)
-        updates, new_opt_state = optimizer.update(grads, opt_state, params)
-        new_params = eqx.apply_updates(params, updates)
-        return new_params, new_opt_state, loss
+        def diffusion_vf(t, y, args):
+            full_sigma = jnp.zeros((3, 3))
+            full_sigma = full_sigma.at[:2, :2].set(self.sigma)
+            return full_sigma
+        self.diffusion_vf = diffusion_vf
 
     @eqx.filter_jit
-    def train_step(params, opt_state, optimizer, key):
-        loss_val, grads = eqx.filter_value_and_grad(loss_fn)(params, key)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = eqx.apply_updates(params, updates)
-        return params, opt_state, loss_val
+    def __call__(self,
+            input_current,
+            t0,
+            t1,
+            v0=None,
+            i0=None,
+            dt0=0.01,
+            max_steps=1000
+        ):
+        s0_key, v0_key, i0_key = jr.split(jr.PRNGKey(159), 3)
+        bm_key = jr.PRNGKey(9876)
 
-    def train():
-        # Initialize neuron with parameters we want to train
-        params = SpikingNeuron(
-            mu=jnp.array([5.0, 3.0]),
-            sigma=jnp.array([[0.2, 0.0],[0.0, 0.2]]),
-            intensity_params=jnp.array([5.0]),
-            alpha=0.03,
-            v_reset=1.0,
-        )
-        
-        learning_rate = 0.1
-        optimizer = optax.adam(learning_rate)
-        opt_state = optimizer.init(eqx.filter(params, eqx.is_array))
+        s0 = jnp.log(jr.uniform(key=s0_key)) - self.alpha
+        if v0 is None:
+            v0 = jr.uniform(key=v0_key)
+        if i0 is None:
+            i0 = jr.uniform(key=i0_key)
+        y0 = jnp.array([v0, i0, s0])
 
         key = jr.PRNGKey(1234)
+        vf = ODETerm(self.drift_vf)
 
-        for step in range(100):
-            key, subkey = jr.split(key)
-            # Use jit to speed up training
-            loss_val, grads = eqx.filter_value_and_grad(loss_fn)(params, subkey)
-            updates, opt_state = optimizer.update(grads, opt_state)
-            params = eqx.apply_updates(params, updates)
-            
-            if step % 10 == 0:
-                print(f"Step={step}, Loss={loss_val}")
-                print(f"mu={params.mu}, intensity_params={params.intensity_params}, alpha={params.alpha}")
+        bm = VirtualBrownianTree(t0, t1, 1e-3, (3, ), key=bm_key)
+        diffusion = ControlTerm(self.diffusion_vf, bm)
+        root_finder = optx.Newton(1e-2, 1e-2, optx.rms_norm)
+        # Event detection is when s crosses 0
+        event = diffrax.Event(self.cond_fn, root_finder)
+        
+        solver = diffrax.Euler() 
+        
+        sde = MultiTerm(vf, diffusion)
 
-        print("Final learned params:")
-        print(params)
-
-    train()
-if __name__ == "__main__":    main()
+        sol = diffrax.diffeqsolve(
+            sde,
+            solver,
+            t0, 
+            t1,
+            dt0,
+            y0,
+            input_current,
+            throw=True,
+            event=event,
+            max_steps=max_steps,
+            )
+        
+        # Check if we got a spike (event occurred)
+        final_time = sol.ts[-1]
+        final_state = sol.ys[-1]
+        # Check if integration stopped early due to event
+        spike_occurred = final_time < (t1 - 1e-7)
+        # Also check state to confirm it was an event trigger
+        spike_time = jnp.where(spike_occurred, final_time, jnp.nan)
+        return sol, spike_time
